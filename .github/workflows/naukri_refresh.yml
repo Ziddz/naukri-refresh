@@ -2,11 +2,9 @@ name: Naukri Profile Refresh
 
 on:
   schedule:
-    # Runs at 8 AM, 11 AM, 2 PM, 5 PM, 8 PM IST (UTC+5:30)
-    # GitHub Actions uses UTC — times adjusted accordingly
+    # 8 AM, 11 AM, 2 PM, 5 PM, 8 PM IST (UTC+5:30 = subtract 5:30)
     - cron: "30 2,5,8,11,14 * * *"
 
-  # Allows you to trigger this manually from the Actions tab
   workflow_dispatch:
 
 jobs:
@@ -23,20 +21,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Run Naukri refresh
         env:
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
         run: python naukri_refresh.py
-        
-      - name: Upload screenshots on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots
-          path: "*.png"
