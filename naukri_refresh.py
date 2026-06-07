@@ -1,8 +1,8 @@
 """
-Naukri Profile Auto-Refresher (API-based, no browser)
-=======================================================
+Naukri Profile Auto-Refresher (API-based)
+==========================================
 Uses Naukri's internal REST API to log in and update the
-Resume Headline — no Playwright, no headless browser needed.
+Resume Headline — no browser needed.
 
 Requirements:
     pip install requests
@@ -35,130 +35,174 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-#  HEADERS (mimic a real browser)
-# ─────────────────────────────────────────────
-BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Content-Type": "application/json",
-    "Origin": "https://www.naukri.com",
-    "Referer": "https://www.naukri.com/",
-    "appid": "109",
-    "systemid": "109",
-}
+
+def make_headers(extra: dict = {}) -> dict:
+    base = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Content-Type": "application/json",
+        "Origin": "https://www.naukri.com",
+        "Referer": "https://www.naukri.com/",
+        "appid": "109",
+        "systemid": "Naukri",
+        "clientid": "d3skt0p",
+        "gid": "LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE",
+    }
+    base.update(extra)
+    return base
 
 
-def login(session: requests.Session) -> dict:
-    """Log in and return the user profile info."""
-    log.info("Logging in to Naukri...")
+def login(session: requests.Session) -> str:
+    """Log in and return the auth token."""
 
+    # Step 1: Hit the login page first to pick up any session cookies
+    log.info("Fetching login page for cookies...")
+    session.get(
+        "https://www.naukri.com/nlogin/login",
+        headers=make_headers({"Accept": "text/html,application/xhtml+xml,*/*"}),
+        timeout=20,
+        allow_redirects=True,
+    )
+    time.sleep(random.uniform(0.5, 1.5))
+
+    # Step 2: POST to login API
+    log.info("Posting login credentials...")
     url = "https://www.naukri.com/central-login-services/v1/login"
+
     payload = {
         "username": NAUKRI_EMAIL,
         "password": NAUKRI_PASSWORD,
+        "type": "login",
     }
 
-    resp = session.post(url, json=payload, headers=BASE_HEADERS, timeout=30)
+    resp = session.post(
+        url,
+        data=json.dumps(payload),   # explicit json.dumps to ensure correct encoding
+        headers=make_headers(),
+        timeout=30,
+    )
 
-    if resp.status_code != 200:
-        raise Exception(f"Login failed with status {resp.status_code}: {resp.text[:300]}")
+    log.info("Login response: %s", resp.status_code)
+
+    if resp.status_code == 400:
+        log.warning("Got 400 — trying alternate payload format...")
+        # Try without 'type' field
+        payload2 = {"username": NAUKRI_EMAIL, "password": NAUKRI_PASSWORD}
+        resp = session.post(url, data=json.dumps(payload2), headers=make_headers(), timeout=30)
+        log.info("Retry response: %s | %s", resp.status_code, resp.text[:200])
+
+    if resp.status_code not in (200, 201):
+        raise Exception(
+            f"Login failed ({resp.status_code}): {resp.text[:400]}\n"
+            f"Response headers: {dict(resp.headers)}"
+        )
 
     data = resp.json()
+    log.debug("Login data keys: %s", list(data.keys()))
 
-    # Extract auth token from response or cookies
+    # Pull token from multiple possible locations
     token = (
         data.get("loginData", {}).get("x-security-token")
         or data.get("x-security-token")
         or resp.headers.get("x-security-token")
-        or session.cookies.get("nauk_at")
+        or data.get("authToken")
+        or data.get("token")
     )
 
     if token:
         session.headers.update({"x-security-token": token})
-        log.info("Login successful. Token acquired.")
+        log.info("Login successful — token acquired.")
     else:
-        log.warning("Login response received but no token found — will rely on session cookies.")
-        log.debug("Response keys: %s", list(data.keys()))
+        log.warning("No token in response — relying on session cookies.")
+        log.info("Response body: %s", resp.text[:400])
 
-    return data
+    return token or ""
 
 
 def get_profile(session: requests.Session) -> dict:
-    """Fetch the current profile / resume headline."""
-    log.info("Fetching current profile...")
+    """Fetch current profile data."""
+    log.info("Fetching profile...")
 
-    url = "https://www.naukri.com/profile-api/v1/user/self"
-    resp = session.get(url, headers=BASE_HEADERS, timeout=30)
+    endpoints = [
+        "https://www.naukri.com/profile-api/v1/user/self",
+        "https://www.naukri.com/resume-services/v3/user/self",
+        "https://www.naukri.com/profile-api/v2/user/profile",
+    ]
 
-    if resp.status_code != 200:
-        raise Exception(f"Could not fetch profile: {resp.status_code} — {resp.text[:300]}")
+    for url in endpoints:
+        resp = session.get(url, headers=make_headers(), timeout=30)
+        log.info("%s -> %s", url, resp.status_code)
+        if resp.status_code == 200:
+            return resp.json()
 
-    return resp.json()
+    raise Exception("Could not fetch profile from any endpoint.")
 
 
 def update_headline(session: requests.Session, current_headline: str) -> None:
-    """Toggle a trailing space on the headline to trigger a profile refresh."""
-    if current_headline.endswith(" "):
-        new_headline = current_headline.rstrip(" ")
-    else:
-        new_headline = current_headline + " "
+    """Toggle trailing space on the headline to mark profile as updated."""
+    new_headline = (
+        current_headline.rstrip(" ")
+        if current_headline.endswith(" ")
+        else current_headline + " "
+    )
 
-    log.info("Updating headline from: '%s'", current_headline[:80])
-    log.info("              to:       '%s'", new_headline[:80])
+    log.info("Headline: '%s...' -> '%s...'", current_headline[:60], new_headline[:60])
 
-    url = "https://www.naukri.com/profile-api/v1/user/self"
+    endpoints_methods = [
+        ("PATCH", "https://www.naukri.com/profile-api/v1/user/self"),
+        ("PUT",   "https://www.naukri.com/profile-api/v1/user/self"),
+        ("PATCH", "https://www.naukri.com/resume-services/v3/user/self"),
+    ]
+
     payload = {"resumeHeadline": new_headline}
 
-    resp = session.patch(url, json=payload, headers=BASE_HEADERS, timeout=30)
-
-    if resp.status_code in (200, 201, 204):
-        log.info("✅  Headline updated successfully.")
-    else:
-        # Try PUT if PATCH didn't work
-        log.warning("PATCH returned %s, trying PUT...", resp.status_code)
-        resp = session.put(url, json=payload, headers=BASE_HEADERS, timeout=30)
+    for method, url in endpoints_methods:
+        resp = session.request(
+            method, url,
+            data=json.dumps(payload),
+            headers=make_headers(),
+            timeout=30,
+        )
+        log.info("%s %s -> %s", method, url, resp.status_code)
         if resp.status_code in (200, 201, 204):
-            log.info("✅  Headline updated via PUT.")
-        else:
-            raise Exception(f"Update failed: {resp.status_code} — {resp.text[:300]}")
+            log.info("✅  Profile refreshed successfully!")
+            return
+
+    raise Exception("Could not update headline via any endpoint.")
 
 
 def refresh_naukri_profile():
-    log.info("=" * 50)
-    log.info("Naukri profile refresh started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("=" * 55)
+    log.info("Naukri refresh started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     session = requests.Session()
+    time.sleep(random.uniform(1.0, 3.0))
 
-    # Small random delay to look more human
-    time.sleep(random.uniform(1.5, 4.0))
-
-    # Step 1: Login
-    login_data = login(session)
-
-    # Step 2: Get current headline
+    login(session)
     profile = get_profile(session)
 
-    # Try common response paths for the headline
+    # Try various paths to find the headline
     headline = (
         profile.get("resumeHeadline")
         or profile.get("profileData", {}).get("resumeHeadline")
         or profile.get("data", {}).get("resumeHeadline")
+        or profile.get("result", {}).get("resumeHeadline")
         or ""
     )
 
     if not headline:
-        log.warning("Could not find resumeHeadline in profile response. Keys: %s", list(profile.keys()))
-        # Use a generic fallback so the update still fires
+        log.warning("Headline not found in profile. Profile keys: %s", list(profile.keys()))
         headline = "Experienced Professional"
 
-    # Step 3: Update
     update_headline(session, headline)
-
-    log.info("Profile refresh complete: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    log.info("=" * 50)
+    log.info("Refresh complete: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("=" * 55)
 
 
 if __name__ == "__main__":
