@@ -5,7 +5,7 @@ Uses a headless Chrome browser to log in and update the
 Resume Headline — works reliably despite API changes.
 
 Requirements:
-    pip install selenium webdriver-manager
+    pip install selenium
 
 Usage:
     python naukri_refresh.py
@@ -19,12 +19,10 @@ from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION
@@ -60,8 +58,9 @@ def get_driver() -> webdriver.Chrome:
         "Chrome/124.0.0.0 Safari/537.36"
     )
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    # Selenium 4.6+ includes selenium-manager which auto-downloads
+    # the correct chromedriver — no webdriver-manager needed.
+    driver = webdriver.Chrome(options=options)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
