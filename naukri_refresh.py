@@ -69,38 +69,60 @@ def login(driver: webdriver.Chrome) -> None:
     """Log in to Naukri."""
     log.info("Navigating to login page...")
     driver.get("https://www.naukri.com/nlogin/login")
-    wait = WebDriverWait(driver, 20)
+    wait = WebDriverWait(driver, 30)
 
-    # Enter email
-    email_field = wait.until(EC.presence_of_element_located((By.ID, "usernameField")))
+    # Wait for the email field — try multiple known selectors
+    log.info("Waiting for email field...")
+    email_field = wait.until(EC.presence_of_element_located((
+        By.CSS_SELECTOR,
+        "input[type='text'][placeholder*='Email'], "
+        "input[type='email'], "
+        "input[placeholder*='Email'], "
+        "input[placeholder*='Username'], "
+        "#usernameField, "
+        "input[name='username']"
+    )))
     email_field.clear()
     email_field.send_keys(NAUKRI_EMAIL)
-    time.sleep(random.uniform(0.3, 0.7))
+    log.info("Email entered.")
+    time.sleep(random.uniform(0.4, 0.8))
 
-    # Enter password
-    password_field = driver.find_element(By.ID, "passwordField")
+    # Password field
+    password_field = driver.find_element(
+        By.CSS_SELECTOR,
+        "input[type='password'], #passwordField, input[name='password']"
+    )
     password_field.clear()
     password_field.send_keys(NAUKRI_PASSWORD)
-    time.sleep(random.uniform(0.3, 0.7))
+    log.info("Password entered.")
+    time.sleep(random.uniform(0.4, 0.8))
 
-    # Click login button
-    login_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
+    # Click the Login button (not Register)
+    login_btn = driver.find_element(
+        By.CSS_SELECTOR,
+        "button[type='submit']"
+    )
     login_btn.click()
+    log.info("Login button clicked.")
 
-    # Wait for successful login (profile icon or redirect away from login page)
+    # Wait for actual redirect away from the login page
     try:
-        wait.until(EC.url_changes("https://www.naukri.com/nlogin/login"))
-        log.info("Login successful — redirected to: %s", driver.current_url)
+        wait.until(EC.url_contains("naukri.com"))
+        wait.until(lambda d: "nlogin" not in d.current_url)
+        log.info("Login successful — now at: %s", driver.current_url)
     except TimeoutException:
-        # Some accounts land on the same URL but show a logged-in state
-        log.warning("URL didn't change, checking for logged-in indicators...")
+        # Last resort: check for a logged-in nav element that never appears on login page
         try:
             wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".nI-gNb-drawer__icon, [class*='naukri-logo'], #login_Layer")
+                (By.CSS_SELECTOR, ".nI-gNb-sb__icon-wrapper, .view-profile-wrapper, [class*='user-name']")
             ))
-            log.info("Login appears successful.")
+            log.info("Login confirmed via nav element.")
         except TimeoutException:
-            raise Exception("Login may have failed — check credentials or if CAPTCHA appeared.")
+            driver.save_screenshot("/tmp/naukri_error.png")
+            raise Exception(
+                f"Login failed — still on: {driver.current_url}. "
+                "Check credentials or if Naukri is showing a CAPTCHA/OTP."
+            )
 
     time.sleep(random.uniform(2.0, 3.5))
 
@@ -110,27 +132,56 @@ def update_headline(driver: webdriver.Chrome) -> None:
     log.info("Navigating to profile page...")
     driver.get("https://www.naukri.com/mnjuser/profile")
 
-    wait = WebDriverWait(driver, 20)
+    wait = WebDriverWait(driver, 30)
 
-    # Wait for the Resume Headline edit button
-    try:
-        headline_edit = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//div[contains(@class,'resumeHeadline')]//span[@class='edit icon']")
-        ))
-    except TimeoutException:
-        # Try alternate selector
-        headline_edit = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//section[contains(.,'Resume Headline')]//span[contains(@class,'edit')]")
-        ))
+    # Wait for profile page to load — look for any edit pencil
+    log.info("Waiting for profile page to load...")
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='edit'], [class*='pencil']")))
+    time.sleep(2)  # let the React components fully render
 
+    # Find the Resume Headline section edit icon — try multiple selectors
+    headline_edit = None
+    selectors = [
+        # Most common pattern: edit icon inside the headline widget
+        "//div[contains(@class,'resumeHeadline')]//span[contains(@class,'edit')]",
+        "//div[contains(@class,'headline')]//span[contains(@class,'edit')]",
+        # Section-based
+        "//section[.//h2[contains(text(),'Resume Headline')]]//span[contains(@class,'edit')]",
+        "//section[.//span[contains(text(),'Resume Headline')]]//span[contains(@class,'edit')]",
+        # Widget header edit button
+        "//div[contains(text(),'Resume Headline')]//following-sibling::*//span[contains(@class,'edit')]",
+        "//span[contains(text(),'Resume Headline')]//ancestor::div[1]//span[contains(@class,'edit')]",
+    ]
+
+    for xpath in selectors:
+        try:
+            headline_edit = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, xpath))
+            )
+            log.info("Found headline edit button with: %s", xpath)
+            break
+        except TimeoutException:
+            continue
+
+    if headline_edit is None:
+        driver.save_screenshot("/tmp/naukri_error.png")
+        raise Exception(
+            "Could not find Resume Headline edit button. "
+            "Screenshot saved — the page structure may have changed."
+        )
+
+    driver.execute_script("arguments[0].scrollIntoView(true);", headline_edit)
+    time.sleep(0.5)
     headline_edit.click()
     log.info("Opened Resume Headline editor.")
     time.sleep(random.uniform(1.0, 1.5))
 
     # Find the textarea
     textarea = wait.until(EC.presence_of_element_located(
-        (By.XPATH, "//textarea[@name='resumeHeadline' or @placeholder]"
-                   " | //div[@contenteditable='true']")
+        (By.CSS_SELECTOR,
+         "textarea[name='resumeHeadline'], "
+         "textarea[placeholder], "
+         "div[contenteditable='true']")
     ))
 
     current_text = textarea.get_attribute("value") or textarea.text or ""
