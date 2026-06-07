@@ -1,1 +1,45 @@
+name: Naukri Profile Refresh
 
+on:
+  schedule:
+    # 8 AM, 11 AM, 2 PM, 5 PM, 8 PM IST (UTC+5:30 = subtract 5:30)
+    - cron: "30 2,5,8,11,14 * * *"
+
+  workflow_dispatch:
+
+jobs:
+  refresh-profile:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Naukri refresh
+        env:
+          NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
+          NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
+        run: python naukri_refresh.py
+
+      - name: Upload error screenshot (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot
+          path: /tmp/naukri_error.png
+          if-no-files-found: ignore
