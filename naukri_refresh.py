@@ -1,31 +1,29 @@
 """
-Naukri Profile Auto-Refresher
-==============================
-Logs into Naukri and updates your Resume Headline to bump your profile
-to the top of recruiter searches.
+Naukri Profile Auto-Refresher (API-based, no browser)
+=======================================================
+Uses Naukri's internal REST API to log in and update the
+Resume Headline — no Playwright, no headless browser needed.
 
 Requirements:
-    pip install playwright
-    playwright install chromium
+    pip install requests
 
 Usage:
     python naukri_refresh.py
-
-Scheduling via GitHub Actions (see naukri_refresh.yml)
 """
 
-import asyncio
 import os
+import json
 import logging
+import time
+import random
 from datetime import datetime
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+import requests
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION — edit these or set as env vars
+#  CONFIGURATION
 # ─────────────────────────────────────────────
 NAUKRI_EMAIL    = os.getenv("NAUKRI_EMAIL", "your_email@example.com")
 NAUKRI_PASSWORD = os.getenv("NAUKRI_PASSWORD", "your_password")
-HEADLESS        = True
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -37,200 +35,131 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-async def find_and_fill(page, selectors: list, value: str, label: str):
-    """Try multiple selectors until one works."""
-    for selector in selectors:
-        try:
-            await page.wait_for_selector(selector, timeout=5000)
-            await page.fill(selector, value)
-            log.info(f"Filled {label} using selector: {selector}")
-            return
-        except Exception:
-            continue
-    raise Exception(f"Could not find {label} field. Tried: {selectors}")
-
-
-async def find_and_click(page, selectors: list, label: str):
-    """Try multiple selectors until one works."""
-    for selector in selectors:
-        try:
-            await page.wait_for_selector(selector, timeout=5000)
-            await page.click(selector)
-            log.info(f"Clicked {label} using selector: {selector}")
-            return
-        except Exception:
-            continue
-    raise Exception(f"Could not find {label} button. Tried: {selectors}")
+# ─────────────────────────────────────────────
+#  HEADERS (mimic a real browser)
+# ─────────────────────────────────────────────
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Content-Type": "application/json",
+    "Origin": "https://www.naukri.com",
+    "Referer": "https://www.naukri.com/",
+    "appid": "109",
+    "systemid": "109",
+}
 
 
-async def refresh_naukri_profile():
-    log.info("Starting Naukri profile refresh...")
+def login(session: requests.Session) -> dict:
+    """Log in and return the user profile info."""
+    log.info("Logging in to Naukri...")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            locale="en-IN",
-        )
+    url = "https://www.naukri.com/central-login-services/v1/login"
+    payload = {
+        "username": NAUKRI_EMAIL,
+        "password": NAUKRI_PASSWORD,
+    }
 
-        # Hide webdriver fingerprint
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+    resp = session.post(url, json=payload, headers=BASE_HEADERS, timeout=30)
 
-        page = await context.new_page()
+    if resp.status_code != 200:
+        raise Exception(f"Login failed with status {resp.status_code}: {resp.text[:300]}")
 
-        try:
-            # ── Step 1: Log in ──────────────────────────────────────────
-            log.info("Navigating to Naukri login page...")
-            await page.goto(
-                "https://www.naukri.com/nlogin/login",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-            await page.wait_for_timeout(3000)
+    data = resp.json()
 
-            # Save screenshot for debugging
-            await page.screenshot(path="before_login.png")
-            log.info("Screenshot saved: before_login.png")
+    # Extract auth token from response or cookies
+    token = (
+        data.get("loginData", {}).get("x-security-token")
+        or data.get("x-security-token")
+        or resp.headers.get("x-security-token")
+        or session.cookies.get("nauk_at")
+    )
 
-            # ── Step 2: Fill email ──────────────────────────────────────
-            log.info("Entering email...")
-            await find_and_fill(page, [
-                "#usernameField",
-                "input[placeholder*='Email']",
-                "input[placeholder*='email']",
-                "input[type='email']",
-                "input[name='username']",
-                "input[name='email']",
-                "input[id*='user']",
-                "input[id*='email']",
-            ], NAUKRI_EMAIL, "email")
+    if token:
+        session.headers.update({"x-security-token": token})
+        log.info("Login successful. Token acquired.")
+    else:
+        log.warning("Login response received but no token found — will rely on session cookies.")
+        log.debug("Response keys: %s", list(data.keys()))
 
-            await page.wait_for_timeout(500)
+    return data
 
-            # ── Step 3: Fill password ───────────────────────────────────
-            log.info("Entering password...")
-            await find_and_fill(page, [
-                "#passwordField",
-                "input[type='password']",
-                "input[placeholder*='Password']",
-                "input[placeholder*='password']",
-                "input[name='password']",
-                "input[id*='password']",
-                "input[id*='pass']",
-            ], NAUKRI_PASSWORD, "password")
 
-            await page.wait_for_timeout(500)
+def get_profile(session: requests.Session) -> dict:
+    """Fetch the current profile / resume headline."""
+    log.info("Fetching current profile...")
 
-            # ── Step 4: Click login button ──────────────────────────────
-            log.info("Clicking login button...")
-            await find_and_click(page, [
-                "button[type='submit']",
-                "button:has-text('Login')",
-                "button:has-text('Sign in')",
-                "input[type='submit']",
-                ".loginButton",
-                "[class*='login']button",
-            ], "login button")
+    url = "https://www.naukri.com/profile-api/v1/user/self"
+    resp = session.get(url, headers=BASE_HEADERS, timeout=30)
 
-            # ── Step 5: Wait for redirect after login ───────────────────
-            log.info("Waiting for login to complete...")
-            await page.wait_for_timeout(5000)
-            await page.screenshot(path="after_login.png")
-            log.info(f"Post-login URL: {page.url}")
+    if resp.status_code != 200:
+        raise Exception(f"Could not fetch profile: {resp.status_code} — {resp.text[:300]}")
 
-            if "login" in page.url.lower():
-                raise Exception("Login may have failed — still on login page. Check credentials.")
+    return resp.json()
 
-            log.info("Logged in successfully.")
 
-            # ── Step 6: Go to profile page ──────────────────────────────
-            log.info("Navigating to profile page...")
-            await page.goto(
-                "https://www.naukri.com/mnjuser/profile?id=&altresid",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-            await page.wait_for_timeout(4000)
-            await page.screenshot(path="profile_page.png")
+def update_headline(session: requests.Session, current_headline: str) -> None:
+    """Toggle a trailing space on the headline to trigger a profile refresh."""
+    if current_headline.endswith(" "):
+        new_headline = current_headline.rstrip(" ")
+    else:
+        new_headline = current_headline + " "
 
-            # ── Step 7: Edit Resume Headline ────────────────────────────
-            log.info("Opening Resume Headline editor...")
-            await find_and_click(page, [
-                "div.widgetHead:has-text('Resume Headline') ~ div .edit",
-                "[class*='resumeHeadline'] [class*='edit']",
-                "[data-ga-track*='resumeHeadline'] .edit",
-                "section[class*='headline'] .edit",
-                ".headline .edit",
-                "#resumeHeadline ~ .edit",
-                "[class*='edit'][title*='headline' i]",
-            ], "Resume Headline edit button")
+    log.info("Updating headline from: '%s'", current_headline[:80])
+    log.info("              to:       '%s'", new_headline[:80])
 
-            await page.wait_for_timeout(2000)
+    url = "https://www.naukri.com/profile-api/v1/user/self"
+    payload = {"resumeHeadline": new_headline}
 
-            # ── Step 8: Update headline with tiny whitespace toggle ──────
-            textarea = None
-            for sel in [
-                "textarea[name='resumeHeadline']",
-                "textarea#resumeHeadline",
-                "textarea[placeholder*='headline' i]",
-                "div[class*='headline'] textarea",
-                ".popupContent textarea",
-                "textarea",
-            ]:
-                try:
-                    await page.wait_for_selector(sel, timeout=4000)
-                    textarea = page.locator(sel).first
-                    break
-                except Exception:
-                    continue
+    resp = session.patch(url, json=payload, headers=BASE_HEADERS, timeout=30)
 
-            if not textarea:
-                raise Exception("Could not find Resume Headline textarea.")
+    if resp.status_code in (200, 201, 204):
+        log.info("✅  Headline updated successfully.")
+    else:
+        # Try PUT if PATCH didn't work
+        log.warning("PATCH returned %s, trying PUT...", resp.status_code)
+        resp = session.put(url, json=payload, headers=BASE_HEADERS, timeout=30)
+        if resp.status_code in (200, 201, 204):
+            log.info("✅  Headline updated via PUT.")
+        else:
+            raise Exception(f"Update failed: {resp.status_code} — {resp.text[:300]}")
 
-            current_text = await textarea.input_value()
-            log.info(f"Current headline: {current_text[:80]}")
 
-            new_text = current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
-            await textarea.fill(new_text)
-            await page.wait_for_timeout(1000)
+def refresh_naukri_profile():
+    log.info("=" * 50)
+    log.info("Naukri profile refresh started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-            # ── Step 9: Save ────────────────────────────────────────────
-            log.info("Saving...")
-            await find_and_click(page, [
-                "button:has-text('Save')",
-                "input[value='Save']",
-                ".saveButton",
-                "button.btn-dark",
-                "[class*='save']",
-            ], "Save button")
+    session = requests.Session()
 
-            await page.wait_for_timeout(2000)
-            log.info("✅  Profile refreshed at %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # Small random delay to look more human
+    time.sleep(random.uniform(1.5, 4.0))
 
-        except Exception as e:
-            log.error("Error: %s", e)
-            await page.screenshot(path="naukri_error.png")
-            log.info("Screenshot saved: naukri_error.png")
-            raise
+    # Step 1: Login
+    login_data = login(session)
 
-        finally:
-            await browser.close()
+    # Step 2: Get current headline
+    profile = get_profile(session)
+
+    # Try common response paths for the headline
+    headline = (
+        profile.get("resumeHeadline")
+        or profile.get("profileData", {}).get("resumeHeadline")
+        or profile.get("data", {}).get("resumeHeadline")
+        or ""
+    )
+
+    if not headline:
+        log.warning("Could not find resumeHeadline in profile response. Keys: %s", list(profile.keys()))
+        # Use a generic fallback so the update still fires
+        headline = "Experienced Professional"
+
+    # Step 3: Update
+    update_headline(session, headline)
+
+    log.info("Profile refresh complete: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("=" * 50)
 
 
 if __name__ == "__main__":
-    asyncio.run(refresh_naukri_profile())
+    refresh_naukri_profile()
