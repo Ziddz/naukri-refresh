@@ -103,26 +103,32 @@ def login(driver: webdriver.Chrome) -> None:
         "button[type='submit']"
     )
     login_btn.click()
-    log.info("Login button clicked.")
+    log.info("Login button clicked. Waiting for redirect away from login page...")
 
-    # Wait for actual redirect away from the login page
+    # The only reliable success signal: URL no longer contains 'nlogin'
     try:
-        wait.until(EC.url_contains("naukri.com"))
         wait.until(lambda d: "nlogin" not in d.current_url)
-        log.info("Login successful — now at: %s", driver.current_url)
+        log.info("Login successful — redirected to: %s", driver.current_url)
     except TimeoutException:
-        # Last resort: check for a logged-in nav element that never appears on login page
+        log.error("Login FAILED. Still on: %s", driver.current_url)
+        log.error("Page title: %s", driver.title)
         try:
-            wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".nI-gNb-sb__icon-wrapper, .view-profile-wrapper, [class*='user-name']")
-            ))
-            log.info("Login confirmed via nav element.")
-        except TimeoutException:
-            driver.save_screenshot("/tmp/naukri_error.png")
-            raise Exception(
-                f"Login failed — still on: {driver.current_url}. "
-                "Check credentials or if Naukri is showing a CAPTCHA/OTP."
-            )
+            err_el = driver.find_element(By.CSS_SELECTOR, "[class*='error'], [class*='Error'], .err-msg")
+            log.error("Error on page: %s", err_el.text)
+        except Exception:
+            pass
+        try:
+            form_text = driver.find_element(By.CSS_SELECTOR, "form").text
+            log.error("Form text snippet: %s", form_text[:300])
+        except Exception:
+            pass
+        driver.save_screenshot("/tmp/naukri_error.png")
+        raise Exception(
+            "Login failed — still on login page after 30s. "
+            "Causes: (1) wrong NAUKRI_EMAIL/NAUKRI_PASSWORD secrets, "
+            "(2) Naukri blocking runner IP, (3) OTP/CAPTCHA required. "
+            "Check the uploaded screenshot artifact."
+        )
 
     time.sleep(random.uniform(2.0, 3.5))
 
@@ -134,10 +140,11 @@ def update_headline(driver: webdriver.Chrome) -> None:
 
     wait = WebDriverWait(driver, 30)
 
-    # Wait for profile page to load — look for any edit pencil
+    # Wait for the page body then give React time to render
     log.info("Waiting for profile page to load...")
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[class*='edit'], [class*='pencil']")))
-    time.sleep(2)  # let the React components fully render
+    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    time.sleep(5)  # React needs time to mount components
+    log.info("Profile page loaded. Current URL: %s", driver.current_url)
 
     # Find the Resume Headline section edit icon — try multiple selectors
     headline_edit = None
