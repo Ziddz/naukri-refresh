@@ -1,17 +1,26 @@
 """
-Naukri Profile Auto-Refresher (Selenium-based)
-===============================================
-Uses a headless Chrome browser to log in and update the
-Resume Headline — works reliably despite API changes.
+Naukri Profile Auto-Refresher (cookie-based)
+=============================================
+Loads a saved login session via cookies — avoids the OTP
+that Naukri triggers when logging in from an unknown IP.
+
+Setup (one time):
+    1. Run get_cookies.py locally to export your session cookies.
+    2. base64-encode the resulting naukri_cookies.json:
+           Mac/Linux:  base64 -i naukri_cookies.json | tr -d '\n'
+           Windows:    certutil -encode naukri_cookies.json tmp.txt
+                       (copy the middle lines, remove line breaks)
+    3. Add the base64 string as a GitHub secret: NAUKRI_COOKIES
+    4. Keep NAUKRI_EMAIL and NAUKRI_PASSWORD secrets too
+       (used as fallback if cookies are expired).
 
 Requirements:
     pip install selenium
-
-Usage:
-    python naukri_refresh.py
 """
 
 import os
+import json
+import base64
 import logging
 import time
 import random
@@ -27,8 +36,9 @@ from selenium.common.exceptions import TimeoutException
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
-NAUKRI_EMAIL    = os.getenv("NAUKRI_EMAIL", "your_email@example.com")
-NAUKRI_PASSWORD = os.getenv("NAUKRI_PASSWORD", "your_password")
+NAUKRI_EMAIL    = os.getenv("NAUKRI_EMAIL", "")
+NAUKRI_PASSWORD = os.getenv("NAUKRI_PASSWORD", "")
+NAUKRI_COOKIES  = os.getenv("NAUKRI_COOKIES", "")   # base64-encoded JSON
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -42,7 +52,6 @@ log = logging.getLogger(__name__)
 
 
 def get_driver() -> webdriver.Chrome:
-    """Set up a headless Chrome driver."""
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
@@ -64,87 +73,109 @@ def get_driver() -> webdriver.Chrome:
     return driver
 
 
-def login(driver: webdriver.Chrome) -> None:
-    """Log in to Naukri using the known field IDs from the real HTML."""
-    log.info("Navigating to login page...")
+def load_cookies(driver: webdriver.Chrome) -> bool:
+    """
+    Decode the base64 NAUKRI_COOKIES secret and inject them.
+    Returns True if cookies were loaded, False if secret is missing.
+    """
+    if not NAUKRI_COOKIES:
+        log.warning("NAUKRI_COOKIES secret not set — falling back to password login.")
+        return False
+
+    try:
+        decoded = base64.b64decode(NAUKRI_COOKIES).decode("utf-8")
+        cookies = json.loads(decoded)
+    except Exception as e:
+        log.error("Failed to decode NAUKRI_COOKIES: %s", e)
+        return False
+
+    # Must visit the domain before setting cookies
+    driver.get("https://www.naukri.com")
+    time.sleep(2)
+
+    for cookie in cookies:
+        # Selenium requires 'name' and 'value'; drop unsupported fields
+        safe = {k: v for k, v in cookie.items()
+                if k in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry")}
+        # Fix domain format
+        if "domain" in safe and not safe["domain"].startswith("."):
+            safe["domain"] = "." + safe["domain"].lstrip(".")
+        try:
+            driver.add_cookie(safe)
+        except Exception as e:
+            log.debug("Skipped cookie %s: %s", safe.get("name"), e)
+
+    log.info("Cookies loaded (%d cookies).", len(cookies))
+    return True
+
+
+def is_logged_in(driver: webdriver.Chrome) -> bool:
+    """Navigate to profile page and check if we land there or get redirected to login."""
+    driver.get("https://www.naukri.com/mnjuser/profile")
+    time.sleep(4)
+    if "nlogin" in driver.current_url or "login" in driver.current_url.lower():
+        log.warning("Cookie session expired or invalid — not logged in.")
+        return False
+    log.info("Session valid — on profile page: %s", driver.current_url)
+    return True
+
+
+def login_with_password(driver: webdriver.Chrome) -> None:
+    """
+    Fallback: log in with email/password using send_keys.
+    This will trigger OTP from unknown IPs — only use if cookies are unavailable.
+    """
+    log.info("Attempting password login (may trigger OTP from this IP)...")
     driver.get("https://www.naukri.com/nlogin/login")
     wait = WebDriverWait(driver, 30)
 
-    # Wait for the email field — confirmed ID from real HTML: #usernameField
-    log.info("Waiting for email field...")
-    email_field = wait.until(
-        EC.presence_of_element_located((By.ID, "usernameField"))
-    )
+    email_field = wait.until(EC.element_to_be_clickable((By.ID, "usernameField")))
+    email_field.click()
+    email_field.send_keys(NAUKRI_EMAIL)
+    time.sleep(0.5)
 
-    # Use the React native input value setter so React's synthetic event system
-    # registers the value — plain JS .value assignment doesn't update React state.
-    react_set_value = """
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value').set;
-        nativeInputValueSetter.call(arguments[0], arguments[1]);
-        arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
-    """
+    pwd_field = driver.find_element(By.ID, "passwordField")
+    pwd_field.click()
+    pwd_field.send_keys(NAUKRI_PASSWORD)
+    time.sleep(0.5)
 
-    driver.execute_script("arguments[0].scrollIntoView(true);", email_field)
-    driver.execute_script(react_set_value, email_field, NAUKRI_EMAIL)
-    log.info("Email entered.")
-    time.sleep(random.uniform(0.5, 1.0))
+    driver.find_element(By.CSS_SELECTOR, "button.blue-btn[type='submit']").click()
 
-    # Password field — confirmed ID: #passwordField
-    password_field = driver.find_element(By.ID, "passwordField")
-    driver.execute_script(react_set_value, password_field, NAUKRI_PASSWORD)
-    log.info("Password entered.")
-    time.sleep(random.uniform(0.5, 1.0))
-
-    # Click the Login button — first submit button in the form (not OTP button)
-    # Confirmed class: .blue-btn with type="submit"
-    login_btn = driver.find_element(By.CSS_SELECTOR, "button.blue-btn[type='submit']")
-    driver.execute_script("arguments[0].click();", login_btn)
-    log.info("Login button clicked. Waiting for redirect...")
-
-    # Only reliable success signal: URL leaves the /nlogin path
     try:
         wait.until(lambda d: "nlogin" not in d.current_url)
-        log.info("Login successful — redirected to: %s", driver.current_url)
+        log.info("Password login successful.")
     except TimeoutException:
-        log.error("Login FAILED. Still on: %s", driver.current_url)
-        log.error("Page title: %s", driver.title)
-        try:
-            err_el = driver.find_element(By.CSS_SELECTOR, ".erLbl")
-            log.error("Form error text: '%s'", err_el.text)
-        except Exception:
-            pass
         driver.save_screenshot("/tmp/naukri_error.png")
         raise Exception(
-            "Login failed — still on login page after 30s. "
-            "Check: (1) NAUKRI_EMAIL and NAUKRI_PASSWORD secrets are correct, "
-            "(2) account doesn't require OTP/CAPTCHA from this IP."
+            "Password login failed. If you received an OTP email, "
+            "set up the NAUKRI_COOKIES secret instead (see get_cookies.py)."
         )
-
-    time.sleep(random.uniform(2.0, 3.0))
 
 
 def update_headline(driver: webdriver.Chrome) -> None:
-    """Click the Resume Headline edit icon, toggle a trailing space, and save."""
-    log.info("Navigating to profile page...")
-    driver.get("https://www.naukri.com/mnjuser/profile")
+    """Click Resume Headline edit, toggle trailing space, save."""
     wait = WebDriverWait(driver, 30)
 
-    # Wait for the Resume Headline widget to appear
-    # Confirmed: .widgetTitle text = "Resume headline", edit icon = span.edit.icon
-    log.info("Waiting for Resume Headline widget...")
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.edit.icon")))
-    time.sleep(2)  # let React fully render
+    # The profile page should already be loaded from is_logged_in()
+    # but navigate again cleanly just in case
+    if "mnjuser/profile" not in driver.current_url:
+        driver.get("https://www.naukri.com/mnjuser/profile")
+        time.sleep(4)
 
-    # Find the edit pencil inside the Resume Headline card
-    # There may be multiple .edit.icon spans — find the one in the headline widget
+    log.info("Looking for Resume Headline edit icon...")
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.edit.icon")))
+    time.sleep(2)
+
+    # Find the edit icon inside the Resume Headline card
     edit_icons = driver.find_elements(By.CSS_SELECTOR, "span.edit.icon")
     headline_edit = None
     for icon in edit_icons:
         try:
-            # Walk up to the card and check if it contains "Resume headline"
-            card = icon.find_element(By.XPATH, "./ancestor::div[contains(@class,'card')]")
-            if "Resume headline" in card.text or "resume headline" in card.text.lower():
+            card = icon.find_element(
+                By.XPATH, "./ancestor::div[contains(@class,'card')]"
+            )
+            card_text = card.text.lower()
+            if "resume headline" in card_text:
                 headline_edit = icon
                 log.info("Found Resume Headline edit icon.")
                 break
@@ -152,54 +183,49 @@ def update_headline(driver: webdriver.Chrome) -> None:
             continue
 
     if headline_edit is None:
-        # Fallback: just use the first edit icon
-        log.warning("Could not identify headline card specifically — using first edit icon.")
+        log.warning("Could not isolate headline card — using first edit icon.")
         headline_edit = edit_icons[0]
 
     driver.execute_script("arguments[0].scrollIntoView(true);", headline_edit)
     time.sleep(0.5)
     driver.execute_script("arguments[0].click();", headline_edit)
-    log.info("Clicked edit icon. Waiting for textarea...")
 
-    # Wait for the edit form — confirmed textarea ID: #resumeHeadlineTxt
+    # Wait for modal URL and textarea
+    log.info("Waiting for edit modal...")
     wait.until(EC.url_contains("modalOpen"))
-    textarea = wait.until(
-        EC.presence_of_element_located((By.ID, "resumeHeadlineTxt"))
-    )
+    textarea = wait.until(EC.presence_of_element_located((By.ID, "resumeHeadlineTxt")))
     time.sleep(1)
 
     current_text = textarea.get_attribute("value") or ""
     log.info("Current headline (%d chars): '%s...'", len(current_text), current_text[:60])
 
-    # Toggle trailing space
     new_text = (
         current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
     )
 
-    # Use native textarea value setter so React's synthetic events fire correctly
-    react_set_textarea = """
-        var nativeTextareaSetter = Object.getOwnPropertyDescriptor(
+    # Native setter triggers React's synthetic events correctly
+    react_set = """
+        var setter = Object.getOwnPropertyDescriptor(
             window.HTMLTextAreaElement.prototype, 'value').set;
-        nativeTextareaSetter.call(arguments[0], arguments[1]);
+        setter.call(arguments[0], arguments[1]);
         arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
     """
-    driver.execute_script(react_set_textarea, textarea, new_text)
-    log.info("New headline set (%d chars).", len(new_text))
+    driver.execute_script(react_set, textarea, new_text)
+    log.info("Headline updated (%d chars).", len(new_text))
     time.sleep(random.uniform(0.5, 1.0))
 
-    # Click Save — confirmed selector: button.btn-dark-ot[type='submit']
+    # Save
     save_btn = driver.find_element(
         By.CSS_SELECTOR, "button.btn-dark-ot[type='submit']"
     )
     driver.execute_script("arguments[0].click();", save_btn)
     log.info("Clicked Save. Waiting for modal to close...")
 
-    # Success: URL returns to base profile page (no modalOpen)
     try:
         wait.until(lambda d: "modalOpen" not in d.current_url)
         log.info("✅  Profile refreshed successfully!")
     except TimeoutException:
-        log.warning("Modal may still be open — save might have failed. Check profile manually.")
+        log.warning("Modal close not detected — may still have saved. Check manually.")
 
 
 def refresh_naukri_profile():
@@ -209,9 +235,18 @@ def refresh_naukri_profile():
     driver = None
     try:
         driver = get_driver()
-        time.sleep(random.uniform(1.0, 2.0))
 
-        login(driver)
+        # Try cookie-based login first
+        cookies_loaded = load_cookies(driver)
+
+        if cookies_loaded and is_logged_in(driver):
+            log.info("Using saved cookie session.")
+        else:
+            # Fallback to password login (will trigger OTP on unknown IPs)
+            login_with_password(driver)
+            driver.get("https://www.naukri.com/mnjuser/profile")
+            time.sleep(4)
+
         update_headline(driver)
 
         log.info("Refresh complete: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
