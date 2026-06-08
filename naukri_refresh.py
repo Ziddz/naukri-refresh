@@ -76,38 +76,23 @@ def login(driver: webdriver.Chrome) -> None:
         EC.presence_of_element_located((By.ID, "usernameField"))
     )
 
-    # Scroll into view and use JS to set value to avoid interactability issues
+    # Use the React native input value setter so React's synthetic event system
+    # registers the value — plain JS .value assignment doesn't update React state.
+    react_set_value = """
+        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set;
+        nativeInputValueSetter.call(arguments[0], arguments[1]);
+        arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+    """
+
     driver.execute_script("arguments[0].scrollIntoView(true);", email_field)
-    driver.execute_script("arguments[0].value = '';", email_field)
-    driver.execute_script(
-        "arguments[0].value = arguments[1];", email_field, NAUKRI_EMAIL
-    )
-    # Also fire input/change events so the React form picks up the value
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-        email_field,
-    )
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-        email_field,
-    )
+    driver.execute_script(react_set_value, email_field, NAUKRI_EMAIL)
     log.info("Email entered.")
     time.sleep(random.uniform(0.5, 1.0))
 
     # Password field — confirmed ID: #passwordField
     password_field = driver.find_element(By.ID, "passwordField")
-    driver.execute_script("arguments[0].value = '';", password_field)
-    driver.execute_script(
-        "arguments[0].value = arguments[1];", password_field, NAUKRI_PASSWORD
-    )
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-        password_field,
-    )
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-        password_field,
-    )
+    driver.execute_script(react_set_value, password_field, NAUKRI_PASSWORD)
     log.info("Password entered.")
     time.sleep(random.uniform(0.5, 1.0))
 
@@ -191,15 +176,14 @@ def update_headline(driver: webdriver.Chrome) -> None:
         current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
     )
 
-    # Set via JS to avoid stale element / interactability issues
-    driver.execute_script("arguments[0].value = '';", textarea)
-    driver.execute_script("arguments[0].value = arguments[1];", textarea, new_text)
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));", textarea
-    )
-    driver.execute_script(
-        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", textarea
-    )
+    # Use native textarea value setter so React's synthetic events fire correctly
+    react_set_textarea = """
+        var nativeTextareaSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value').set;
+        nativeTextareaSetter.call(arguments[0], arguments[1]);
+        arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+    """
+    driver.execute_script(react_set_textarea, textarea, new_text)
     log.info("New headline set (%d chars).", len(new_text))
     time.sleep(random.uniform(0.5, 1.0))
 
