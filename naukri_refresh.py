@@ -57,55 +57,67 @@ def get_driver() -> webdriver.Chrome:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-
-    # Selenium 4.6+ includes selenium-manager which auto-downloads
-    # the correct chromedriver — no webdriver-manager needed.
     driver = webdriver.Chrome(options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
     return driver
 
 
 def login(driver: webdriver.Chrome) -> None:
-    """Log in to Naukri."""
+    """Log in to Naukri using the known field IDs from the real HTML."""
     log.info("Navigating to login page...")
     driver.get("https://www.naukri.com/nlogin/login")
     wait = WebDriverWait(driver, 30)
 
-    # Wait for the email field — try multiple known selectors
+    # Wait for the email field — confirmed ID from real HTML: #usernameField
     log.info("Waiting for email field...")
-    email_field = wait.until(EC.presence_of_element_located((
-        By.CSS_SELECTOR,
-        "input[type='text'][placeholder*='Email'], "
-        "input[type='email'], "
-        "input[placeholder*='Email'], "
-        "input[placeholder*='Username'], "
-        "#usernameField, "
-        "input[name='username']"
-    )))
-    email_field.clear()
-    email_field.send_keys(NAUKRI_EMAIL)
+    email_field = wait.until(
+        EC.presence_of_element_located((By.ID, "usernameField"))
+    )
+
+    # Scroll into view and use JS to set value to avoid interactability issues
+    driver.execute_script("arguments[0].scrollIntoView(true);", email_field)
+    driver.execute_script("arguments[0].value = '';", email_field)
+    driver.execute_script(
+        "arguments[0].value = arguments[1];", email_field, NAUKRI_EMAIL
+    )
+    # Also fire input/change events so the React form picks up the value
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+        email_field,
+    )
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+        email_field,
+    )
     log.info("Email entered.")
-    time.sleep(random.uniform(0.4, 0.8))
+    time.sleep(random.uniform(0.5, 1.0))
 
-    # Password field
-    password_field = driver.find_element(
-        By.CSS_SELECTOR,
-        "input[type='password'], #passwordField, input[name='password']"
+    # Password field — confirmed ID: #passwordField
+    password_field = driver.find_element(By.ID, "passwordField")
+    driver.execute_script("arguments[0].value = '';", password_field)
+    driver.execute_script(
+        "arguments[0].value = arguments[1];", password_field, NAUKRI_PASSWORD
     )
-    password_field.clear()
-    password_field.send_keys(NAUKRI_PASSWORD)
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+        password_field,
+    )
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+        password_field,
+    )
     log.info("Password entered.")
-    time.sleep(random.uniform(0.4, 0.8))
+    time.sleep(random.uniform(0.5, 1.0))
 
-    # Click the Login button (not Register)
-    login_btn = driver.find_element(
-        By.CSS_SELECTOR,
-        "button[type='submit']"
-    )
-    login_btn.click()
-    log.info("Login button clicked. Waiting for redirect away from login page...")
+    # Click the Login button — first submit button in the form (not OTP button)
+    # Confirmed class: .blue-btn with type="submit"
+    login_btn = driver.find_element(By.CSS_SELECTOR, "button.blue-btn[type='submit']")
+    driver.execute_script("arguments[0].click();", login_btn)
+    log.info("Login button clicked. Waiting for redirect...")
 
-    # The only reliable success signal: URL no longer contains 'nlogin'
+    # Only reliable success signal: URL leaves the /nlogin path
     try:
         wait.until(lambda d: "nlogin" not in d.current_url)
         log.info("Login successful — redirected to: %s", driver.current_url)
@@ -113,111 +125,97 @@ def login(driver: webdriver.Chrome) -> None:
         log.error("Login FAILED. Still on: %s", driver.current_url)
         log.error("Page title: %s", driver.title)
         try:
-            err_el = driver.find_element(By.CSS_SELECTOR, "[class*='error'], [class*='Error'], .err-msg")
-            log.error("Error on page: %s", err_el.text)
-        except Exception:
-            pass
-        try:
-            form_text = driver.find_element(By.CSS_SELECTOR, "form").text
-            log.error("Form text snippet: %s", form_text[:300])
+            err_el = driver.find_element(By.CSS_SELECTOR, ".erLbl")
+            log.error("Form error text: '%s'", err_el.text)
         except Exception:
             pass
         driver.save_screenshot("/tmp/naukri_error.png")
         raise Exception(
             "Login failed — still on login page after 30s. "
-            "Causes: (1) wrong NAUKRI_EMAIL/NAUKRI_PASSWORD secrets, "
-            "(2) Naukri blocking runner IP, (3) OTP/CAPTCHA required. "
-            "Check the uploaded screenshot artifact."
+            "Check: (1) NAUKRI_EMAIL and NAUKRI_PASSWORD secrets are correct, "
+            "(2) account doesn't require OTP/CAPTCHA from this IP."
         )
 
-    time.sleep(random.uniform(2.0, 3.5))
+    time.sleep(random.uniform(2.0, 3.0))
 
 
 def update_headline(driver: webdriver.Chrome) -> None:
-    """Navigate to profile edit and toggle the resume headline."""
+    """Click the Resume Headline edit icon, toggle a trailing space, and save."""
     log.info("Navigating to profile page...")
     driver.get("https://www.naukri.com/mnjuser/profile")
-
     wait = WebDriverWait(driver, 30)
 
-    # Wait for the page body then give React time to render
-    log.info("Waiting for profile page to load...")
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(5)  # React needs time to mount components
-    log.info("Profile page loaded. Current URL: %s", driver.current_url)
+    # Wait for the Resume Headline widget to appear
+    # Confirmed: .widgetTitle text = "Resume headline", edit icon = span.edit.icon
+    log.info("Waiting for Resume Headline widget...")
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.edit.icon")))
+    time.sleep(2)  # let React fully render
 
-    # Find the Resume Headline section edit icon — try multiple selectors
+    # Find the edit pencil inside the Resume Headline card
+    # There may be multiple .edit.icon spans — find the one in the headline widget
+    edit_icons = driver.find_elements(By.CSS_SELECTOR, "span.edit.icon")
     headline_edit = None
-    selectors = [
-        # Most common pattern: edit icon inside the headline widget
-        "//div[contains(@class,'resumeHeadline')]//span[contains(@class,'edit')]",
-        "//div[contains(@class,'headline')]//span[contains(@class,'edit')]",
-        # Section-based
-        "//section[.//h2[contains(text(),'Resume Headline')]]//span[contains(@class,'edit')]",
-        "//section[.//span[contains(text(),'Resume Headline')]]//span[contains(@class,'edit')]",
-        # Widget header edit button
-        "//div[contains(text(),'Resume Headline')]//following-sibling::*//span[contains(@class,'edit')]",
-        "//span[contains(text(),'Resume Headline')]//ancestor::div[1]//span[contains(@class,'edit')]",
-    ]
-
-    for xpath in selectors:
+    for icon in edit_icons:
         try:
-            headline_edit = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.XPATH, xpath))
-            )
-            log.info("Found headline edit button with: %s", xpath)
-            break
-        except TimeoutException:
+            # Walk up to the card and check if it contains "Resume headline"
+            card = icon.find_element(By.XPATH, "./ancestor::div[contains(@class,'card')]")
+            if "Resume headline" in card.text or "resume headline" in card.text.lower():
+                headline_edit = icon
+                log.info("Found Resume Headline edit icon.")
+                break
+        except Exception:
             continue
 
     if headline_edit is None:
-        driver.save_screenshot("/tmp/naukri_error.png")
-        raise Exception(
-            "Could not find Resume Headline edit button. "
-            "Screenshot saved — the page structure may have changed."
-        )
+        # Fallback: just use the first edit icon
+        log.warning("Could not identify headline card specifically — using first edit icon.")
+        headline_edit = edit_icons[0]
 
     driver.execute_script("arguments[0].scrollIntoView(true);", headline_edit)
     time.sleep(0.5)
-    headline_edit.click()
-    log.info("Opened Resume Headline editor.")
-    time.sleep(random.uniform(1.0, 1.5))
+    driver.execute_script("arguments[0].click();", headline_edit)
+    log.info("Clicked edit icon. Waiting for textarea...")
 
-    # Find the textarea
-    textarea = wait.until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR,
-         "textarea[name='resumeHeadline'], "
-         "textarea[placeholder], "
-         "div[contenteditable='true']")
-    ))
+    # Wait for the edit form — confirmed textarea ID: #resumeHeadlineTxt
+    wait.until(EC.url_contains("modalOpen"))
+    textarea = wait.until(
+        EC.presence_of_element_located((By.ID, "resumeHeadlineTxt"))
+    )
+    time.sleep(1)
 
-    current_text = textarea.get_attribute("value") or textarea.text or ""
-    log.info("Current headline (first 60 chars): '%s...'", current_text[:60])
+    current_text = textarea.get_attribute("value") or ""
+    log.info("Current headline (%d chars): '%s...'", len(current_text), current_text[:60])
 
     # Toggle trailing space
-    new_text = current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
+    new_text = (
+        current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
+    )
 
-    # Clear and re-type
-    textarea.clear()
-    time.sleep(0.3)
-    textarea.send_keys(new_text)
+    # Set via JS to avoid stale element / interactability issues
+    driver.execute_script("arguments[0].value = '';", textarea)
+    driver.execute_script("arguments[0].value = arguments[1];", textarea, new_text)
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));", textarea
+    )
+    driver.execute_script(
+        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));", textarea
+    )
+    log.info("New headline set (%d chars).", len(new_text))
     time.sleep(random.uniform(0.5, 1.0))
 
-    # Save
-    save_btn = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, "//button[normalize-space()='Save' or normalize-space()='SAVE']")
-    ))
-    save_btn.click()
-    log.info("Clicked Save.")
+    # Click Save — confirmed selector: button.btn-dark-ot[type='submit']
+    save_btn = driver.find_element(
+        By.CSS_SELECTOR, "button.btn-dark-ot[type='submit']"
+    )
+    driver.execute_script("arguments[0].click();", save_btn)
+    log.info("Clicked Save. Waiting for modal to close...")
 
-    # Confirm save (wait for editor to close or success toast)
+    # Success: URL returns to base profile page (no modalOpen)
     try:
-        wait.until(EC.invisibility_of_element_located(
-            (By.XPATH, "//button[normalize-space()='Save' or normalize-space()='SAVE']")
-        ))
+        wait.until(lambda d: "modalOpen" not in d.current_url)
         log.info("✅  Profile refreshed successfully!")
     except TimeoutException:
-        log.warning("Save confirmation not detected — it may still have saved.")
+        log.warning("Modal may still be open — save might have failed. Check profile manually.")
 
 
 def refresh_naukri_profile():
@@ -227,7 +225,7 @@ def refresh_naukri_profile():
     driver = None
     try:
         driver = get_driver()
-        time.sleep(random.uniform(1.0, 2.5))
+        time.sleep(random.uniform(1.0, 2.0))
 
         login(driver)
         update_headline(driver)
@@ -236,7 +234,6 @@ def refresh_naukri_profile():
     except Exception as e:
         log.error("Refresh failed: %s", e)
         if driver:
-            # Save a screenshot for debugging
             try:
                 driver.save_screenshot("/tmp/naukri_error.png")
                 log.info("Screenshot saved to /tmp/naukri_error.png")
