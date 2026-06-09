@@ -62,56 +62,66 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-def fetch_naukri_otp(max_wait=60) -> str:
+def fetch_naukri_otp(max_wait=90) -> str:
     """
-    Poll Gmail for a Naukri OTP email sent in the last 2 minutes.
-    Retries for up to max_wait seconds.
+    Poll Gmail for a Naukri OTP email that arrived after this function was called.
+    Skips old emails from previous runs. Retries for up to max_wait seconds.
     Returns the 6-digit OTP string.
     """
     log.info("Waiting for Naukri OTP email in Gmail...")
     service = get_gmail_service()
     start = time.time()
+    start_ms = int(start * 1000)  # Gmail internalDate is in milliseconds
 
     while time.time() - start < max_wait:
         try:
             results = service.users().messages().list(
                 userId="me",
-                q="from:info@naukri.com newer_than:15m",
-                maxResults=3,
+                q="from:info@naukri.com newer_than:10m",
+                maxResults=5,
             ).execute()
 
             messages = results.get("messages", [])
             log.info("Gmail search returned %d messages.", len(messages))
-            if messages:
-                for msg_ref in messages:
-                    msg = service.users().messages().get(
-                        userId="me",
-                        id=msg_ref["id"],
-                        format="full",
-                    ).execute()
 
-                    # Log subject for debugging
-                    headers = msg.get("payload", {}).get("headers", [])
-                    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-                    sender = next((h["value"] for h in headers if h["name"] == "From"), "")
-                    log.info("Checking email — From: %s | Subject: %s", sender, subject)
+            for msg_ref in messages:
+                msg = service.users().messages().get(
+                    userId="me",
+                    id=msg_ref["id"],
+                    format="full",
+                ).execute()
 
-                    body = extract_email_body(msg)
-                    otp = re.search(r"\b(\d{6})\b", body)
-                    if otp:
-                        log.info("OTP found: %s", otp.group(1))
-                        return otp.group(1)
+                internal_date_ms = int(msg.get("internalDate", 0))
+                headers = msg.get("payload", {}).get("headers", [])
+                subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+                sender = next((h["value"] for h in headers if h["name"] == "From"), "")
+                age_s = (time.time() * 1000 - internal_date_ms) / 1000
+                log.info("Email — From: %s | Subject: %s | Age: %.0fs", sender, subject, age_s)
+
+                # Skip emails that arrived before we started waiting (old runs)
+                if internal_date_ms < start_ms - 30000:
+                    log.info("Skipping old email (%.0fs before OTP request).", (start_ms - internal_date_ms) / 1000)
+                    continue
+
+                body = extract_email_body(msg)
+                log.info("Body snippet: %s", body[:300].replace("\n", " "))
+                otp = re.search(r"\b(\d{6})\b", body)
+                if otp:
+                    log.info("OTP found: %s", otp.group(1))
+                    return otp.group(1)
+                else:
+                    log.warning("No 6-digit OTP found in email body.")
 
         except Exception as e:
             log.warning("Gmail poll error: %s", e)
 
         time.sleep(5)
 
-    raise Exception("OTP not received in Gmail within 60 seconds.")
+    raise Exception("OTP not received in Gmail within 90 seconds.")
 
 
 def extract_email_body(msg) -> str:
-    """Extract plain text from a Gmail message."""
+    """Extract text from a Gmail message, stripping HTML if needed."""
     payload = msg.get("payload", {})
 
     def decode_part(part):
@@ -120,16 +130,44 @@ def extract_email_body(msg) -> str:
             return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
         return ""
 
-    # Single part
-    if "parts" not in payload:
-        return decode_part(payload)
+    def get_all_parts(payload):
+        """Recursively collect all parts from nested multipart messages."""
+        parts = []
+        if "parts" in payload:
+            for part in payload["parts"]:
+                parts.extend(get_all_parts(part))
+        else:
+            parts.append(payload)
+        return parts
 
-    # Multi-part — prefer text/plain
-    for part in payload["parts"]:
+    all_parts = get_all_parts(payload)
+
+    # Prefer plain text
+    for part in all_parts:
         if part.get("mimeType") == "text/plain":
-            return decode_part(part)
-    # Fallback to first part
-    return decode_part(payload["parts"][0])
+            text = decode_part(part)
+            if text.strip():
+                return text
+
+    # Fallback: use HTML and strip tags
+    for part in all_parts:
+        if part.get("mimeType") == "text/html":
+            html = decode_part(part)
+            if html.strip():
+                # Strip HTML tags to get plain text
+                import re as _re
+                text = _re.sub(r'<[^>]+>', ' ', html)
+                text = _re.sub(r'&amp;', '&', text)
+                text = _re.sub(r'&lt;', '<', text)
+                text = _re.sub(r'&gt;', '>', text)
+                text = _re.sub(r'&#[0-9]+;', ' ', text)
+                text = _re.sub(r'\s+', ' ', text)
+                return text
+
+    # Last resort: decode whatever is there
+    if all_parts:
+        return decode_part(all_parts[0])
+    return ""
 
 
 # ─────────────────────────────────────────────
