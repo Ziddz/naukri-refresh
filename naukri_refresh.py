@@ -76,25 +76,31 @@ def fetch_naukri_otp(max_wait=60) -> str:
         try:
             results = service.users().messages().list(
                 userId="me",
-                q="from:info@naukri.com subject:OTP newer_than:10m",
-                maxResults=5,
+                q="from:info@naukri.com newer_than:15m",
+                maxResults=3,
             ).execute()
 
             messages = results.get("messages", [])
+            log.info("Gmail search returned %d messages.", len(messages))
             if messages:
-                # Get the most recent one
-                msg = service.users().messages().get(
-                    userId="me",
-                    id=messages[0]["id"],
-                    format="full",
-                ).execute()
+                for msg_ref in messages:
+                    msg = service.users().messages().get(
+                        userId="me",
+                        id=msg_ref["id"],
+                        format="full",
+                    ).execute()
 
-                # Extract body text
-                body = extract_email_body(msg)
-                otp = re.search(r"\b(\d{6})\b", body)
-                if otp:
-                    log.info("OTP found: %s", otp.group(1))
-                    return otp.group(1)
+                    # Log subject for debugging
+                    headers = msg.get("payload", {}).get("headers", [])
+                    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+                    sender = next((h["value"] for h in headers if h["name"] == "From"), "")
+                    log.info("Checking email — From: %s | Subject: %s", sender, subject)
+
+                    body = extract_email_body(msg)
+                    otp = re.search(r"\b(\d{6})\b", body)
+                    if otp:
+                        log.info("OTP found: %s", otp.group(1))
+                        return otp.group(1)
 
         except Exception as e:
             log.warning("Gmail poll error: %s", e)
