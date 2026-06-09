@@ -249,15 +249,28 @@ def _submit_otp(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     """Read OTP from Gmail and type it into the Naukri OTP fields."""
     otp = fetch_naukri_otp(max_wait=90)
 
-    # Wait for OTP inputs to appear — try multiple selector patterns
-    time.sleep(2)
+    # Wait for OTP inputs to appear
+    time.sleep(3)
 
-    # Pattern 1: 6 individual single-char boxes
-    otp_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text'][maxlength='1']")
+    # Log all inputs for debugging
+    all_inputs = driver.find_elements(By.TAG_NAME, "input")
+    log.info("All inputs on OTP page (%d total):", len(all_inputs))
+    for inp in all_inputs:
+        log.info("  type=%s maxlength=%s id=%s placeholder=%s",
+            inp.get_attribute("type"),
+            inp.get_attribute("maxlength"),
+            inp.get_attribute("id"),
+            inp.get_attribute("placeholder"),
+        )
 
-    # Pattern 2: single OTP input field
+    # Try all inputs with maxlength=1 regardless of type
+    otp_inputs = driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
+
+    # Fallback: any input that's visible and not hidden
     if not otp_inputs:
-        otp_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='number'][maxlength='1']")
+        otp_inputs = [i for i in all_inputs
+                      if i.get_attribute("type") not in ("hidden", "submit", "button")
+                      and i.is_displayed()]
 
     log.info("Found %d OTP input boxes.", len(otp_inputs))
 
