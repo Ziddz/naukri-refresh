@@ -76,7 +76,7 @@ def fetch_naukri_otp(max_wait=60) -> str:
         try:
             results = service.users().messages().list(
                 userId="me",
-                q="from:no-reply@naukri.com subject:OTP newer_than:2m",
+                q="from:info@naukri.com subject:OTP newer_than:10m",
                 maxResults=5,
             ).execute()
 
@@ -203,7 +203,7 @@ def _is_otp_screen(driver) -> bool:
 
 def _submit_otp(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     """Read OTP from Gmail and type it into the Naukri OTP fields."""
-    otp = fetch_naukri_otp(max_wait=60)
+    otp = fetch_naukri_otp(max_wait=90)
 
     # Naukri uses 6 individual single-character input boxes for OTP
     otp_inputs = driver.find_elements(
