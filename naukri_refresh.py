@@ -249,23 +249,40 @@ def _submit_otp(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     """Read OTP from Gmail and type it into the Naukri OTP fields."""
     otp = fetch_naukri_otp(max_wait=90)
 
-    # Naukri uses 6 individual single-character input boxes for OTP
-    otp_inputs = driver.find_elements(
-        By.CSS_SELECTOR, "input[type='text'][maxlength='1']"
-    )
+    # Wait for OTP inputs to appear — try multiple selector patterns
+    time.sleep(2)
+
+    # Pattern 1: 6 individual single-char boxes
+    otp_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text'][maxlength='1']")
+
+    # Pattern 2: single OTP input field
+    if not otp_inputs:
+        otp_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='number'][maxlength='1']")
+
+    log.info("Found %d OTP input boxes.", len(otp_inputs))
 
     if len(otp_inputs) >= 6:
-        # Individual boxes
+        # Type each digit into its own box
         for i, digit in enumerate(otp[:6]):
-            otp_inputs[i].click()
-            otp_inputs[i].send_keys(digit)
+            box = otp_inputs[i]
+            driver.execute_script("arguments[0].click();", box)
             time.sleep(0.1)
+            box.send_keys(digit)
+            time.sleep(0.15)
+    elif len(otp_inputs) == 1:
+        driver.execute_script("arguments[0].click();", otp_inputs[0])
+        otp_inputs[0].send_keys(otp)
     else:
-        # Single input box fallback
-        otp_input = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "input[type='text'], input[type='number']")
-        ))
-        otp_input.send_keys(otp)
+        # Broader fallback — find any visible input near the OTP heading
+        try:
+            otp_input = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//input[@type='text' or @type='number' or @type='tel']")
+            ))
+            otp_input.send_keys(otp)
+        except Exception as e:
+            log.error("Could not find OTP input field: %s", e)
+            driver.save_screenshot("/tmp/naukri_error.png")
+            raise
 
     log.info("OTP entered. Submitting...")
     time.sleep(1)
@@ -273,12 +290,14 @@ def _submit_otp(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
     # Click Verify button
     try:
         verify_btn = driver.find_element(
-            By.XPATH, "//button[contains(text(),'Verify') or contains(text(),'VERIFY') or contains(text(),'Submit')]"
+            By.XPATH,
+            "//button[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VERIFY')"
+            " or contains(translate(text(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'SUBMIT')]"
         )
-        verify_btn.click()
+        driver.execute_script("arguments[0].click();", verify_btn)
+        log.info("Clicked Verify button.")
     except Exception:
-        # Sometimes submits automatically after last digit
-        pass
+        log.info("No Verify button found — OTP may auto-submit.")
 
     # Wait for redirect after OTP
     try:
