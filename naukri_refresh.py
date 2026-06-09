@@ -1,21 +1,19 @@
 """
-Naukri Profile Auto-Refresher (cookie-based)
-=============================================
-Loads a saved login session via cookies — avoids the OTP
-that Naukri triggers when logging in from an unknown IP.
+Naukri Profile Auto-Refresher
+==============================
+Logs in via Selenium. If Naukri triggers OTP, automatically
+reads it from Gmail and submits it.
 
-Setup (one time):
-    1. Run get_cookies.py locally to export your session cookies.
-    2. base64-encode the resulting naukri_cookies.json:
-           Mac/Linux:  base64 -i naukri_cookies.json | tr -d '\n'
-           Windows:    certutil -encode naukri_cookies.json tmp.txt
-                       (copy the middle lines, remove line breaks)
-    3. Add the base64 string as a GitHub secret: NAUKRI_COOKIES
-    4. Keep NAUKRI_EMAIL and NAUKRI_PASSWORD secrets too
-       (used as fallback if cookies are expired).
+One-time setup:
+    See GMAIL_SETUP.md for how to get GMAIL_CREDENTIALS_B64 secret.
+
+GitHub Secrets required:
+    NAUKRI_EMAIL           — your Naukri login email
+    NAUKRI_PASSWORD        — your Naukri password
+    GMAIL_CREDENTIALS_B64  — base64-encoded Gmail OAuth credentials JSON
 
 Requirements:
-    pip install selenium
+    pip install selenium google-auth google-auth-oauthlib google-api-python-client
 """
 
 import os
@@ -24,7 +22,8 @@ import base64
 import logging
 import time
 import random
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -36,13 +35,10 @@ from selenium.common.exceptions import TimeoutException
 # ─────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────
-NAUKRI_EMAIL    = os.getenv("NAUKRI_EMAIL", "")
-NAUKRI_PASSWORD = os.getenv("NAUKRI_PASSWORD", "")
-NAUKRI_COOKIES  = os.getenv("NAUKRI_COOKIES", "")   # base64-encoded JSON
+NAUKRI_EMAIL           = os.getenv("NAUKRI_EMAIL", "")
+NAUKRI_PASSWORD        = os.getenv("NAUKRI_PASSWORD", "")
+GMAIL_CREDENTIALS_B64  = os.getenv("GMAIL_CREDENTIALS_B64", "")
 
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -50,6 +46,89 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────
+#  GMAIL OTP READER
+# ─────────────────────────────────────────────
+
+def get_gmail_service():
+    """Build Gmail API service from base64-encoded credentials in GitHub secret."""
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds_json = base64.b64decode(GMAIL_CREDENTIALS_B64).decode("utf-8")
+    creds_data = json.loads(creds_json)
+    creds = Credentials.from_authorized_user_info(creds_data)
+    return build("gmail", "v1", credentials=creds)
+
+
+def fetch_naukri_otp(max_wait=60) -> str:
+    """
+    Poll Gmail for a Naukri OTP email sent in the last 2 minutes.
+    Retries for up to max_wait seconds.
+    Returns the 6-digit OTP string.
+    """
+    log.info("Waiting for Naukri OTP email in Gmail...")
+    service = get_gmail_service()
+    start = time.time()
+
+    while time.time() - start < max_wait:
+        try:
+            results = service.users().messages().list(
+                userId="me",
+                q="from:no-reply@naukri.com subject:OTP newer_than:2m",
+                maxResults=5,
+            ).execute()
+
+            messages = results.get("messages", [])
+            if messages:
+                # Get the most recent one
+                msg = service.users().messages().get(
+                    userId="me",
+                    id=messages[0]["id"],
+                    format="full",
+                ).execute()
+
+                # Extract body text
+                body = extract_email_body(msg)
+                otp = re.search(r"\b(\d{6})\b", body)
+                if otp:
+                    log.info("OTP found: %s", otp.group(1))
+                    return otp.group(1)
+
+        except Exception as e:
+            log.warning("Gmail poll error: %s", e)
+
+        time.sleep(5)
+
+    raise Exception("OTP not received in Gmail within 60 seconds.")
+
+
+def extract_email_body(msg) -> str:
+    """Extract plain text from a Gmail message."""
+    payload = msg.get("payload", {})
+
+    def decode_part(part):
+        data = part.get("body", {}).get("data", "")
+        if data:
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        return ""
+
+    # Single part
+    if "parts" not in payload:
+        return decode_part(payload)
+
+    # Multi-part — prefer text/plain
+    for part in payload["parts"]:
+        if part.get("mimeType") == "text/plain":
+            return decode_part(part)
+    # Fallback to first part
+    return decode_part(payload["parts"][0])
+
+
+# ─────────────────────────────────────────────
+#  BROWSER
+# ─────────────────────────────────────────────
 
 def get_driver() -> webdriver.Chrome:
     options = Options()
@@ -73,59 +152,12 @@ def get_driver() -> webdriver.Chrome:
     return driver
 
 
-def load_cookies(driver: webdriver.Chrome) -> bool:
-    """
-    Decode the base64 NAUKRI_COOKIES secret and inject them.
-    Returns True if cookies were loaded, False if secret is missing.
-    """
-    if not NAUKRI_COOKIES:
-        log.warning("NAUKRI_COOKIES secret not set — falling back to password login.")
-        return False
+# ─────────────────────────────────────────────
+#  LOGIN
+# ─────────────────────────────────────────────
 
-    try:
-        decoded = base64.b64decode(NAUKRI_COOKIES).decode("utf-8")
-        cookies = json.loads(decoded)
-    except Exception as e:
-        log.error("Failed to decode NAUKRI_COOKIES: %s", e)
-        return False
-
-    # Must visit the domain before setting cookies
-    driver.get("https://www.naukri.com")
-    time.sleep(2)
-
-    for cookie in cookies:
-        # Selenium requires 'name' and 'value'; drop unsupported fields
-        safe = {k: v for k, v in cookie.items()
-                if k in ("name", "value", "domain", "path", "secure", "httpOnly", "expiry")}
-        # Fix domain format
-        if "domain" in safe and not safe["domain"].startswith("."):
-            safe["domain"] = "." + safe["domain"].lstrip(".")
-        try:
-            driver.add_cookie(safe)
-        except Exception as e:
-            log.debug("Skipped cookie %s: %s", safe.get("name"), e)
-
-    log.info("Cookies loaded (%d cookies).", len(cookies))
-    return True
-
-
-def is_logged_in(driver: webdriver.Chrome) -> bool:
-    """Navigate to profile page and check if we land there or get redirected to login."""
-    driver.get("https://www.naukri.com/mnjuser/profile")
-    time.sleep(4)
-    if "nlogin" in driver.current_url or "login" in driver.current_url.lower():
-        log.warning("Cookie session expired or invalid — not logged in.")
-        return False
-    log.info("Session valid — on profile page: %s", driver.current_url)
-    return True
-
-
-def login_with_password(driver: webdriver.Chrome) -> None:
-    """
-    Fallback: log in with email/password using send_keys.
-    This will trigger OTP from unknown IPs — only use if cookies are unavailable.
-    """
-    log.info("Attempting password login (may trigger OTP from this IP)...")
+def login(driver: webdriver.Chrome) -> None:
+    log.info("Navigating to login page...")
     driver.get("https://www.naukri.com/nlogin/login")
     wait = WebDriverWait(driver, 30)
 
@@ -140,24 +172,86 @@ def login_with_password(driver: webdriver.Chrome) -> None:
     time.sleep(0.5)
 
     driver.find_element(By.CSS_SELECTOR, "button.blue-btn[type='submit']").click()
+    log.info("Login submitted.")
 
+    # Wait up to 30s — either redirect (success) or OTP screen appears
+    for _ in range(30):
+        time.sleep(1)
+        url = driver.current_url
+        if "nlogin" not in url:
+            log.info("Logged in directly — no OTP needed.")
+            return
+        # Check if OTP screen is showing
+        if _is_otp_screen(driver):
+            log.info("OTP screen detected — fetching OTP from Gmail...")
+            _submit_otp(driver, wait)
+            return
+
+    driver.save_screenshot("/tmp/naukri_error.png")
+    raise Exception("Login failed — neither redirected nor OTP screen appeared.")
+
+
+def _is_otp_screen(driver) -> bool:
+    """Check if the OTP input screen is currently showing."""
+    try:
+        return driver.find_element(
+            By.CSS_SELECTOR, "input[type='text'][maxlength='1'], .otpContainer, [class*='otp']"
+        ).is_displayed()
+    except Exception:
+        return False
+
+
+def _submit_otp(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+    """Read OTP from Gmail and type it into the Naukri OTP fields."""
+    otp = fetch_naukri_otp(max_wait=60)
+
+    # Naukri uses 6 individual single-character input boxes for OTP
+    otp_inputs = driver.find_elements(
+        By.CSS_SELECTOR, "input[type='text'][maxlength='1']"
+    )
+
+    if len(otp_inputs) >= 6:
+        # Individual boxes
+        for i, digit in enumerate(otp[:6]):
+            otp_inputs[i].click()
+            otp_inputs[i].send_keys(digit)
+            time.sleep(0.1)
+    else:
+        # Single input box fallback
+        otp_input = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, "input[type='text'], input[type='number']")
+        ))
+        otp_input.send_keys(otp)
+
+    log.info("OTP entered. Submitting...")
+    time.sleep(1)
+
+    # Click Verify button
+    try:
+        verify_btn = driver.find_element(
+            By.XPATH, "//button[contains(text(),'Verify') or contains(text(),'VERIFY') or contains(text(),'Submit')]"
+        )
+        verify_btn.click()
+    except Exception:
+        # Sometimes submits automatically after last digit
+        pass
+
+    # Wait for redirect after OTP
     try:
         wait.until(lambda d: "nlogin" not in d.current_url)
-        log.info("Password login successful.")
+        log.info("OTP verified — logged in successfully.")
     except TimeoutException:
         driver.save_screenshot("/tmp/naukri_error.png")
-        raise Exception(
-            "Password login failed. If you received an OTP email, "
-            "set up the NAUKRI_COOKIES secret instead (see get_cookies.py)."
-        )
+        raise Exception("OTP submission failed — still on login page.")
 
+
+# ─────────────────────────────────────────────
+#  HEADLINE UPDATE
+# ─────────────────────────────────────────────
 
 def update_headline(driver: webdriver.Chrome) -> None:
-    """Click Resume Headline edit, toggle trailing space, save."""
     wait = WebDriverWait(driver, 30)
 
-    # The profile page should already be loaded from is_logged_in()
-    # but navigate again cleanly just in case
     if "mnjuser/profile" not in driver.current_url:
         driver.get("https://www.naukri.com/mnjuser/profile")
         time.sleep(4)
@@ -166,16 +260,12 @@ def update_headline(driver: webdriver.Chrome) -> None:
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.edit.icon")))
     time.sleep(2)
 
-    # Find the edit icon inside the Resume Headline card
     edit_icons = driver.find_elements(By.CSS_SELECTOR, "span.edit.icon")
     headline_edit = None
     for icon in edit_icons:
         try:
-            card = icon.find_element(
-                By.XPATH, "./ancestor::div[contains(@class,'card')]"
-            )
-            card_text = card.text.lower()
-            if "resume headline" in card_text:
+            card = icon.find_element(By.XPATH, "./ancestor::div[contains(@class,'card')]")
+            if "resume headline" in card.text.lower():
                 headline_edit = icon
                 log.info("Found Resume Headline edit icon.")
                 break
@@ -190,7 +280,6 @@ def update_headline(driver: webdriver.Chrome) -> None:
     time.sleep(0.5)
     driver.execute_script("arguments[0].click();", headline_edit)
 
-    # Wait for modal URL and textarea
     log.info("Waiting for edit modal...")
     wait.until(EC.url_contains("modalOpen"))
     textarea = wait.until(EC.presence_of_element_located((By.ID, "resumeHeadlineTxt")))
@@ -199,11 +288,8 @@ def update_headline(driver: webdriver.Chrome) -> None:
     current_text = textarea.get_attribute("value") or ""
     log.info("Current headline (%d chars): '%s...'", len(current_text), current_text[:60])
 
-    new_text = (
-        current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
-    )
+    new_text = current_text.rstrip(" ") if current_text.endswith(" ") else current_text + " "
 
-    # Native setter triggers React's synthetic events correctly
     react_set = """
         var setter = Object.getOwnPropertyDescriptor(
             window.HTMLTextAreaElement.prototype, 'value').set;
@@ -214,10 +300,7 @@ def update_headline(driver: webdriver.Chrome) -> None:
     log.info("Headline updated (%d chars).", len(new_text))
     time.sleep(random.uniform(0.5, 1.0))
 
-    # Save
-    save_btn = driver.find_element(
-        By.CSS_SELECTOR, "button.btn-dark-ot[type='submit']"
-    )
+    save_btn = driver.find_element(By.CSS_SELECTOR, "button.btn-dark-ot[type='submit']")
     driver.execute_script("arguments[0].click();", save_btn)
     log.info("Clicked Save. Waiting for modal to close...")
 
@@ -225,8 +308,12 @@ def update_headline(driver: webdriver.Chrome) -> None:
         wait.until(lambda d: "modalOpen" not in d.current_url)
         log.info("✅  Profile refreshed successfully!")
     except TimeoutException:
-        log.warning("Modal close not detected — may still have saved. Check manually.")
+        log.warning("Modal close not detected — may still have saved.")
 
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 
 def refresh_naukri_profile():
     log.info("=" * 55)
@@ -235,20 +322,8 @@ def refresh_naukri_profile():
     driver = None
     try:
         driver = get_driver()
-
-        # Try cookie-based login first
-        cookies_loaded = load_cookies(driver)
-
-        if cookies_loaded and is_logged_in(driver):
-            log.info("Using saved cookie session.")
-        else:
-            # Fallback to password login (will trigger OTP on unknown IPs)
-            login_with_password(driver)
-            driver.get("https://www.naukri.com/mnjuser/profile")
-            time.sleep(4)
-
+        login(driver)
         update_headline(driver)
-
         log.info("Refresh complete: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     except Exception as e:
         log.error("Refresh failed: %s", e)
